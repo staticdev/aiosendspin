@@ -726,6 +726,9 @@ class PushStream:
         self._catchup_state: dict[TransformKey, Literal["catching_up", "live"]] = {}
         self._catchup_roles: dict[TransformKey, set[Role]] = {}
         self._catchup_tasks: dict[TransformKey, asyncio.Task[None]] = {}
+        # Set whenever a new PCM chunk lands in `_pcm_chunk_cache`. Catch-up tasks
+        # await this so they keep up with quick commits.
+        self._pcm_cache_signal: asyncio.Event | None = None
         # TransformKey cache by (role_id, channel_id_int) - avoids rebuilding keys each frame
         self._transform_key_cache: dict[tuple[int, int], TransformKey] = {}
         # Last encoded input end timestamp per TransformKey for long-gap reset handling.
@@ -743,6 +746,12 @@ class PushStream:
     def now_us(self) -> int:
         """Return current timestamp from the stream's clock in microseconds."""
         return self._clock.now_us()
+
+    def _signal_pcm_cache_update(self) -> None:
+        """Wake any catch-up tasks waiting for new PCM chunks."""
+        signal = self._pcm_cache_signal
+        if signal is not None:
+            signal.set()
 
     @property
     def is_stopped(self) -> bool:
@@ -1058,6 +1067,7 @@ class PushStream:
                     self._channel_timing[channel_id] += reference_duration_us
 
             # Cache PCM chunks before encoding (if enabled)
+            cached_any_pcm = False
             for channel_id, (pcm_bytes, fmt) in prepared.items():
                 channel_int = channel_id.int
                 if channel_int not in self._pcm_cache_enabled_channels:
@@ -1072,6 +1082,13 @@ class PushStream:
                     sample_type=fmt.sample_type,
                 )
                 self._pcm_chunk_cache.setdefault(channel_int, deque()).append(pcm_chunk)
+                cached_any_pcm = True
+            if cached_any_pcm:
+                self._signal_pcm_cache_update()
+                if self._catchup_tasks:
+                    # Yield so any active catch-up task gets a chance to consume the new
+                    # PCM and finish before live encoding for its TransformKey resumes.
+                    await asyncio.sleep(0)
 
             # Role-based audio delivery via hooks
             role_cache_results = await self._deliver_audio_to_roles(
@@ -1264,6 +1281,7 @@ class PushStream:
                         sample_type=fmt.sample_type,
                     )
                     self._pcm_chunk_cache.setdefault(channel_int, deque()).append(pcm_chunk)
+                    self._signal_pcm_cache_update()
 
                 # For late-join injection, historical chunks may already be too old by the
                 # time they're processed. Keep timeline/cache continuity, but don't deliver
@@ -1413,6 +1431,24 @@ class PushStream:
             if state is None:
                 state = _create_resampler_state(resampler_key, source_format, target_format)
                 self._cache_resampler(state)
+            elif (
+                state.pending_input_timestamp_us is not None
+                and state.pending_input_timestamp_us > input_timestamp_us
+            ):
+                # Resampler already consumed this chunk (e.g. catch-up task
+                # pre-processed the PCM cache and promoted the warmed graph).
+                # Re-pushing the same input would duplicate samples in the
+                # encoder buffer and shift content vs labels. Emit no output.
+                empty = _ResampledPCM(
+                    pcm_data=b"",
+                    output_start_ts=state.pending_timestamp_us or input_timestamp_us,
+                    sample_count=0,
+                    needs_s32_to_s24_conversion=state.needs_s32_to_s24_conversion,
+                    sample_type=state.target_sample_type,
+                )
+                shared_results_by_resampler[resampler_key] = empty
+                results[pcm_key] = empty
+                continue
 
             resampled = _resample_pcm_standalone(
                 state, source_pcm, source_format, input_timestamp_us
@@ -1756,6 +1792,16 @@ class PushStream:
                 self._transform_last_input_end_us.pop(tkey, None)
                 if req.transformer is not None:
                     req.transformer.reset()
+            if not self._other_roles_share_resampler_shape(req, channel_id, role):
+                # Drop orphan resampler so a rejoin sees no stale FIR state.
+                for rkey in list(self._resamplers.keys()):
+                    if (
+                        rkey.channel_id == channel_id
+                        and rkey.target_sample_rate == req.sample_rate
+                        and rkey.target_bit_depth == req.bit_depth
+                        and rkey.target_channels == req.channels
+                    ):
+                        self._resamplers.pop(rkey, None)
         for tkey in list(self._catchup_roles.keys()):
             roles = self._catchup_roles[tkey]
             roles.discard(role)
@@ -1868,6 +1914,14 @@ class PushStream:
                             self._ensure_role_started(role)
                         return
 
+                if self._has_established_resampler_for(req, channel_id):
+                    # Sharing a resampler key with a live role would shift this
+                    # role's audio across the hand-off; skip historical replay.
+                    self._rebase_far_ahead_join_tail(channel_id, role)
+                    if self._channel_timing:
+                        self._ensure_role_started(role)
+                    return
+
                 self._catchup_state[cache_key] = "catching_up"
                 self._catchup_roles[cache_key] = {role}
                 self._catchup_tasks[cache_key] = create_task(
@@ -1925,6 +1979,44 @@ class PushStream:
                 tkey = self._build_transform_key(req, channel_id, role)
                 if tkey == cache_key:
                     return True
+        return False
+
+    def _other_roles_share_resampler_shape(
+        self, req: AudioRequirements, channel_id: UUID, exclude_role: Role
+    ) -> bool:
+        """Check whether another role drives a resampler at the same target PCM shape."""
+        for client in self._group.clients:
+            for role in client.active_roles:
+                if role is exclude_role:
+                    continue
+                if not self._role_in_audio_pipeline(client, role):
+                    continue
+                other_req = role.get_audio_requirements()
+                if other_req is None:
+                    continue
+                other_channel = other_req.channel_id or MAIN_CHANNEL
+                if other_channel != channel_id:
+                    continue
+                if (
+                    other_req.sample_rate == req.sample_rate
+                    and other_req.bit_depth == req.bit_depth
+                    and other_req.channels == req.channels
+                ):
+                    return True
+        return False
+
+    def _has_established_resampler_for(self, req: AudioRequirements, channel_id: UUID) -> bool:
+        """Check whether a live FIR resampler already exists at the same target PCM shape."""
+        for rkey, rstate in self._resamplers.items():
+            if rstate.is_passthrough:
+                continue
+            if (
+                rkey.channel_id == channel_id
+                and rkey.target_sample_rate == req.sample_rate
+                and rkey.target_bit_depth == req.bit_depth
+                and rkey.target_channels == req.channels
+            ):
+                return True
         return False
 
     def _channel_has_other_audio_roles(self, channel_id: UUID, exclude_role: Role) -> bool:
@@ -2216,6 +2308,9 @@ class PushStream:
         # back-shifts the first live chunk via candidate_base.
         catchup_resamplers: dict[_ResamplerKey, _ResamplerState] = {}
         catchup_quantizers: dict[_ResamplerKey, _ResamplerState] = {}
+        # Pre-existing keys belong to other live roles; concurrent stubs for
+        # this role's tkey will appear later and are safe to overwrite.
+        established_resampler_keys = set(self._resamplers.keys())
 
         try:
             if encoder is not None:
@@ -2261,30 +2356,39 @@ class PushStream:
             # Track source PCM progress separately from encoded progress. Some
             # codecs buffer input and may emit no packets for a given chunk.
             last_source_end_us = eligible[-1].timestamp_us + eligible[-1].duration_us
-            idle_loops = 0
-            max_idle_loops = 50  # ~500ms at 10ms sleep
+            if self._pcm_cache_signal is None:
+                self._pcm_cache_signal = asyncio.Event()
+            signal = self._pcm_cache_signal
+            # Abandon catch-up if no new PCM arrives in time.
+            idle_timeout_s = 0.5
 
             while last_encoded_end_us < target_ts:
-                await asyncio.sleep(0)
-
                 new_pcm = [
                     chunk
                     for chunk in self._pcm_chunk_cache.get(channel_int, [])
                     if chunk.timestamp_us >= last_source_end_us
                 ]
                 if not new_pcm:
-                    idle_loops += 1
-                    if idle_loops >= max_idle_loops:
-                        _LOGGER.debug(
-                            "Catch-up idle timeout for %s (encoded_end=%s target=%s)",
-                            cache_key,
-                            last_encoded_end_us,
-                            target_ts,
-                        )
-                        break
-                    await asyncio.sleep(0.01)
-                    continue
-                idle_loops = 0
+                    # Clear-then-recheck guards against the commit_audio set()
+                    # racing in between our cache scan and entering wait().
+                    signal.clear()
+                    new_pcm = [
+                        chunk
+                        for chunk in self._pcm_chunk_cache.get(channel_int, [])
+                        if chunk.timestamp_us >= last_source_end_us
+                    ]
+                    if not new_pcm:
+                        try:
+                            await asyncio.wait_for(signal.wait(), timeout=idle_timeout_s)
+                        except TimeoutError:
+                            _LOGGER.debug(
+                                "Catch-up idle timeout for %s (encoded_end=%s target=%s)",
+                                cache_key,
+                                last_encoded_end_us,
+                                target_ts,
+                            )
+                            break
+                        continue
                 last_source_end_us = new_pcm[-1].timestamp_us + new_pcm[-1].duration_us
 
                 new_encoded = await self._encode_catchup_sequence(
@@ -2300,17 +2404,13 @@ class PushStream:
                     self._role_chunk_cache[cache_key].extend(new_encoded)
                     last_encoded_end_us = new_encoded[-1].timestamp_us + new_encoded[-1].duration_us
 
-            # Drain FIR-held tail so encoder.pending and the role chunk cache reach the
-            # live timeline before live encoding begins.
-            drained = self._drain_catchup_resamplers(
-                catchup_resamplers,
-                catchup_quantizers,
-                encoder,
-                req,
-                channel_id,
-            )
-            if drained and self._catchup_state.get(cache_key) == "catching_up":
-                self._role_chunk_cache[cache_key].extend(drained)
+            # Promote FIR-warmed catch-up state, skipping shared live keys.
+            for rkey, rstate in catchup_resamplers.items():
+                if rkey not in established_resampler_keys:
+                    self._resamplers[rkey] = rstate
+            for qkey, qstate in catchup_quantizers.items():
+                if qkey not in established_resampler_keys:
+                    self._resamplers[qkey] = qstate
 
             now_us = self._clock.now_us()
             encoded_cache = self._role_chunk_cache.get(cache_key, [])
